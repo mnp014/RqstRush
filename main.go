@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -24,6 +26,7 @@ var (
 	lastModTime   time.Time
 	workerWg      sync.WaitGroup
 	workersActive bool
+	jobQueue      chan struct{} // Controls worker jobs
 )
 
 // LoadConfig reads `config.json` only if modified.
@@ -64,10 +67,10 @@ func LoadConfig() bool {
 }
 
 // Worker function that sends HTTP requests.
-func worker(client *http.Client, waitGroup *sync.WaitGroup) {
-	defer waitGroup.Done()
+func worker(client *http.Client, wg *sync.WaitGroup) {
+	defer wg.Done()
 
-	for {
+	for range jobQueue {
 		configLock.RLock()
 		url := config.TargetURL
 		configLock.RUnlock()
@@ -78,14 +81,22 @@ func worker(client *http.Client, waitGroup *sync.WaitGroup) {
 			continue
 		}
 
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Println("Request failed:", err)
-			continue
-		}
-		resp.Body.Close()
+		// Retry logic
+		maxRetries := 3
+		for i := 0; i < maxRetries; i++ {
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				atomic.AddUint64(&reqCounter, 1)
+				break // Exit retry loop if request succeeds
+			}
 
-		atomic.AddUint64(&reqCounter, 1)
+			log.Printf("Request failed (attempt %d): %v\n", i+1, err)
+			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond) // Exponential backoff
+		}
+
+		// Introduce a slight random delay to avoid bulk failures
+		time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
 	}
 }
 
@@ -104,19 +115,39 @@ func RestartWorkers() {
 	// Stop current workers
 	if workersActive {
 		log.Println("Stopping workers...")
+		close(jobQueue) // Close the job channel so old workers exit
 		workerWg.Wait()
 	}
 
 	// Start new workers
 	log.Println("Starting new workers:", config.Concurrency)
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        config.Concurrency,
+			MaxIdleConnsPerHost: config.Concurrency,
+			DisableKeepAlives:   false, // Keep-alive should be enabled
+			DialContext: (&net.Dialer{
+				Timeout:   2 * time.Second, // Keep connection timeout low
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
+		Timeout: 10 * time.Second, // Adjust timeout to prevent excessive failures
+	}
+
 	workerWg = sync.WaitGroup{}
 	workersActive = true
+	jobQueue = make(chan struct{}, config.Concurrency)
 
 	for i := 0; i < config.Concurrency; i++ {
 		workerWg.Add(1)
 		go worker(client, &workerWg)
 	}
+
+	go func() {
+		for {
+			jobQueue <- struct{}{} // Properly enqueue jobs
+		}
+	}()
 }
 
 // LogStats logs requests every second and tracks 100K request time.
